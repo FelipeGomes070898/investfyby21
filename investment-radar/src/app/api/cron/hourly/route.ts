@@ -96,30 +96,32 @@ export async function POST(req: NextRequest) {
     const batches: (typeof news)[] = [];
     for (let i = 0; i < news.length; i += 8) batches.push(news.slice(i, i + 8));
 
+    const batchResults = await Promise.allSettled(
+      batches.map((batch) => classifyNewsBatch(batch, watchedSymbols))
+    );
+
     let processedCount = 0;
-    for (const batch of batches) {
-      try {
-        const classified = await classifyNewsBatch(batch, watchedSymbols);
-        for (const item of classified) {
-          await supabase.from("news_alerts").upsert(
-            {
-              region: item.region,
-              headline: item.headline,
-              summary: item.summary,
-              related_symbols: item.relatedSymbols,
-              impact: item.impact,
-              changes_thesis: item.changesThesis,
-              source_url: item.link,
-              source_name: item.sourceName,
-              published_at: item.publishedAt,
-            },
-            { onConflict: "headline" }
-          );
-          processedCount++;
-        }
-      } catch (batchErr) {
-        // Um lote com problema não deve derrubar os outros lotes.
-        log.push(`Erro num lote de notícias: ${(batchErr as Error).message}`);
+    for (const result of batchResults) {
+      if (result.status !== "fulfilled") {
+        log.push(`Erro num lote de notícias: ${result.reason}`);
+        continue;
+      }
+      for (const item of result.value) {
+        await supabase.from("news_alerts").upsert(
+          {
+            region: item.region,
+            headline: item.headline,
+            summary: item.summary,
+            related_symbols: item.relatedSymbols,
+            impact: item.impact,
+            changes_thesis: item.changesThesis,
+            source_url: item.link,
+            source_name: item.sourceName,
+            published_at: item.publishedAt,
+          },
+          { onConflict: "headline" }
+        );
+        processedCount++;
       }
     }
     log.push(`Notícias processadas: ${processedCount}/${news.length}`);
