@@ -1,0 +1,15 @@
+name: Radar horário
+
+on:
+  schedule:
+    - cron: "5 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Chamar rota de atualização
+        run: |
+          curl -f -X POST "${{ secrets.APP_URL }}/api/cron/hourly" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}"
