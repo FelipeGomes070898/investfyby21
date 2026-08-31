@@ -30,21 +30,14 @@ async function fetchOne(ticker: string, token: string): Promise<StockQuote | nul
 }
 
 // O plano gratuito do brapi.dev permite apenas 1 ativo por requisição,
-// então buscamos ticker por ticker em vez de mandar todos juntos numa única chamada.
+// então buscamos ticker por ticker — mas em paralelo, para não demorar demais.
 export async function fetchBrStockQuotes(tickers: string[]): Promise<StockQuote[]> {
   const token = process.env.BRAPI_TOKEN;
   if (!token || tickers.length === 0) return [];
 
-  const results: StockQuote[] = [];
-  for (const ticker of tickers) {
-    try {
-      const quote = await fetchOne(ticker, token);
-      if (quote) results.push(quote);
-    } catch (err) {
-      console.error(`Erro brapi (${ticker}):`, err);
-    }
-    // pequeno intervalo pra não estourar o limite de requisições por minuto do plano gratuito
-    await new Promise((r) => setTimeout(r, 300));
-  }
-  return results;
+  const settled = await Promise.allSettled(tickers.map((ticker) => fetchOne(ticker, token)));
+  return settled
+    .filter((r): r is PromiseFulfilledResult<StockQuote | null> => r.status === "fulfilled")
+    .map((r) => r.value)
+    .filter((q): q is StockQuote => q !== null);
 }
