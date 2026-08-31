@@ -41,16 +41,9 @@ export async function fetchUsStockQuotes(tickers: string[]): Promise<StockQuote[
   const apiKey = process.env.FINNHUB_API_KEY;
   if (!apiKey || tickers.length === 0) return [];
 
-  // Finnhub free tier: ~60 chamadas/min. Buscamos em série com um pequeno intervalo para não estourar o limite.
-  const out: StockQuote[] = [];
-  for (const ticker of tickers) {
-    try {
-      const q = await fetchOne(ticker, apiKey);
-      if (q) out.push(q);
-    } catch (err) {
-      console.error(`Erro Finnhub para ${ticker}:`, err);
-    }
-    await new Promise((r) => setTimeout(r, 250));
-  }
-  return out;
+  const settled = await Promise.allSettled(tickers.map((ticker) => fetchOne(ticker, apiKey)));
+  return settled
+    .filter((r): r is PromiseFulfilledResult<StockQuote | null> => r.status === "fulfilled")
+    .map((r) => r.value)
+    .filter((q): q is StockQuote => q !== null);
 }
