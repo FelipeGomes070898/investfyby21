@@ -66,8 +66,6 @@ Dados: ${JSON.stringify(params.facts, null, 2)}`;
       text: parsed.text,
     };
   } catch {
-    // Se ainda assim vier um JSON quebrado, não derruba o resto do radar —
-    // devolve um resultado neutro sinalizando o problema, em vez de lançar erro.
     return {
       score: 5,
       breakdown: {},
@@ -103,7 +101,7 @@ Devolva SOMENTE um JSON válido: um array de objetos no formato
 
   const response = await client.messages.create({
     model: MODEL,
-    max_tokens: 4000,
+    max_tokens: 6000,
     system: systemPrompt,
     messages: [{ role: "user", content: userPrompt }],
   });
@@ -111,13 +109,19 @@ Devolva SOMENTE um JSON válido: um array de objetos no formato
   const textBlock = response.content.find((b) => b.type === "text");
   if (!textBlock || textBlock.type !== "text") return [];
 
-  const parsedList = extractJson(textBlock.text) as Array<{
+  let parsedList: Array<{
     headline: string;
     summary: string;
     impact: "positivo" | "neutro" | "negativo";
     changesThesis: boolean;
     relatedSymbols: string[];
   }>;
+
+  try {
+    parsedList = extractJson(textBlock.text);
+  } catch {
+    return [];
+  }
 
   return items
     .map((item) => {
