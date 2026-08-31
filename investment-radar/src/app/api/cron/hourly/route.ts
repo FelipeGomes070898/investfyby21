@@ -51,7 +51,7 @@ export async function POST(req: NextRequest) {
     try {
       const analysis = await generateAssetAnalysis({ symbol, assetType, facts });
 
-      await supabase.from("asset_snapshots").upsert(
+      const { error: snapshotError } = await supabase.from("asset_snapshots").upsert(
         {
           symbol,
           asset_type: assetType,
@@ -68,13 +68,19 @@ export async function POST(req: NextRequest) {
         },
         { onConflict: "symbol,asset_type" }
       );
+      if (snapshotError) {
+        log.push(`Erro ao salvar snapshot de ${symbol}: ${snapshotError.message}`);
+      }
 
-      await supabase.from("asset_history").insert({
+      const { error: historyError } = await supabase.from("asset_history").insert({
         symbol,
         asset_type: assetType,
         price,
         score: analysis.score,
       });
+      if (historyError) {
+        log.push(`Erro ao salvar histórico de ${symbol}: ${historyError.message}`);
+      }
     } catch (err) {
       log.push(`Erro ao analisar ${symbol}: ${(err as Error).message}`);
     }
