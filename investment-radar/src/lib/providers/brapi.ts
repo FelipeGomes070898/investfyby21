@@ -1,19 +1,8 @@
 // Documentação: https://brapi.dev/docs
 import type { StockQuote } from "../types";
 
-export async function fetchBrStockQuotes(tickers: string[]): Promise<StockQuote[]> {
-  const token = process.env.BRAPI_TOKEN;
-  if (!token || tickers.length === 0) return [];
-
-  const url = `https://brapi.dev/api/quote/${tickers.join(",")}?fundamental=true&token=${token}`;
-  const res = await fetch(url, { next: { revalidate: 0 } });
-  if (!res.ok) {
-    console.error("Erro brapi:", res.status, await res.text());
-    return [];
-  }
-
-  const json = await res.json();
-  return (json?.results ?? []).map((d: any) => ({
+function mapQuote(d: any): StockQuote {
+  return {
     symbol: d.symbol,
     name: d.longName ?? d.shortName ?? d.symbol,
     price: d.regularMarketPrice,
@@ -25,5 +14,37 @@ export async function fetchBrStockQuotes(tickers: string[]): Promise<StockQuote[
     roe: d.returnOnEquity ? d.returnOnEquity * 100 : null,
     marketCap: d.marketCap ?? null,
     provider: "brapi",
-  }));
+  };
+}
+
+async function fetchOne(ticker: string, token: string): Promise<StockQuote | null> {
+  const url = `https://brapi.dev/api/quote/${ticker}?fundamental=true&token=${token}`;
+  const res = await fetch(url, { next: { revalidate: 0 } });
+  if (!res.ok) {
+    console.error(`Erro brapi (${ticker}):`, res.status, await res.text());
+    return null;
+  }
+  const json = await res.json();
+  const d = json?.results?.[0];
+  return d ? mapQuote(d) : null;
+}
+
+// O plano gratuito do brapi.dev permite apenas 1 ativo por requisição,
+// então buscamos ticker por ticker em vez de mandar todos juntos numa única chamada.
+export async function fetchBrStockQuotes(tickers: string[]): Promise<StockQuote[]> {
+  const token = process.env.BRAPI_TOKEN;
+  if (!token || tickers.length === 0) return [];
+
+  const results: StockQuote[] = [];
+  for (const ticker of tickers) {
+    try {
+      const quote = await fetchOne(ticker, token);
+      if (quote) results.push(quote);
+    } catch (err) {
+      console.error(`Erro brapi (${ticker}):`, err);
+    }
+    // pequeno intervalo pra não estourar o limite de requisições por minuto do plano gratuito
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  return results;
 }
