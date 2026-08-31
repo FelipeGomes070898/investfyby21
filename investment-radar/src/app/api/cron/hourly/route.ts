@@ -1,129 +1,136 @@
-import { NextRequest, NextResponse } from "next/server";
-import { createAdminClient } from "@/lib/supabase/admin";
-import { fetchBrStockQuotes } from "@/lib/providers/brapi";
-import { fetchUsStockQuotes } from "@/lib/providers/finnhub";
-import { fetchCrossReferencedCrypto } from "@/lib/providers/cryptoAggregate";
-import { fetchAllNews } from "@/lib/providers/rssNews";
-import { generateAssetAnalysis, classifyNewsBatch } from "@/lib/claude";
-import { stockFacts, cryptoFacts } from "@/lib/scoring";
-import { DEFAULT_BR_STOCKS, DEFAULT_US_STOCKS, DEFAULT_CRYPTO } from "@/lib/defaultAssets";
-import type { AssetType } from "@/lib/types";
+import Anthropic from "@anthropic-ai/sdk";
+import type { AssetAnalysis, ClassifiedNews, NewsItem } from "./types";
 
-export const maxDuration = 300; // segundos — várias chamadas de API + Claude, precisa de folga
-
-function isAuthorized(req: NextRequest): boolean {
-  const auth = req.headers.get("authorization");
-  return auth === `Bearer ${process.env.CRON_SECRET}`;
+// Este arquivo só deve ser importado por código de servidor (rotas /api, cron).
+// A chave nunca deve chegar ao navegador.
+function getClient() {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) throw new Error("ANTHROPIC_API_KEY não configurada.");
+  return new Anthropic({ apiKey });
 }
 
-export async function POST(req: NextRequest) {
-  if (!process.env.CRON_SECRET || !isAuthorized(req)) {
-    return NextResponse.json({ error: "não autorizado" }, { status: 401 });
+// Configurável via env caso a Anthropic lance um modelo mais novo no futuro.
+const MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-5";
+
+function extractJson(text: string): any {
+  const cleaned = text.replace(/```json/g, "").replace(/```/g, "").trim();
+  return JSON.parse(cleaned);
+}
+
+/**
+ * Gera a análise no estilo "fundamentos + valuation + margem de segurança" para uma ação ou cripto,
+ * a partir dos dados numéricos já buscados nas APIs (nunca inventados pelo modelo).
+ */
+export async function generateAssetAnalysis(params: {
+  symbol: string;
+  assetType: "acao_br" | "acao_us" | "cripto";
+  facts: Record<string, unknown>;
+}): Promise<AssetAnalysis> {
+  const client = getClient();
+
+  const systemPrompt = `Você é um analista que segue rigorosamente um modelo de valuation por fundamentos.
+Regras:
+- Use APENAS os números fornecidos em "dados". Nunca invente indicadores que não foram dados.
+- Para ações: avalie P/L, P/VP, dividend yield, ROE, sustentabilidade do lucro.
+- Para cripto: avalie tokenomics (supply, FDV vs market cap), liquidez (volume/market cap), e se for meme coin, deixe claro que fundamentos tradicionais não se aplicam e o peso maior é liquidez+narrativa+risco de concentração.
+- Sempre inclua uma ressalva de que isso é uma análise educacional, não recomendação personalizada.
+- Devolva SOMENTE um JSON válido, sem markdown, sem texto fora do JSON, no formato:
+{
+  "score": <número de 0 a 10>,
+  "breakdown": { "<fator>": <número de -2 a 2>, ... },
+  "classification": "<ex: 🟢 Atrativa, 🟡 Razoável, 🟠 Cara, 🔴 Muito cara, ⚠️ Alto risco>",
+  "text": "<análise em português, em texto corrido com quebras de linha \\n, no mesmo estilo didático de: quanto a empresa/projeto ganha, quanto estou pagando, quanto retorna pra mim, e se isso é sustentável>"
+}`;
+
+  const userPrompt = `Ativo: ${params.symbol} (${params.assetType})
+Dados: ${JSON.stringify(params.facts, null, 2)}`;
+
+  const response = await client.messages.create({
+    model: MODEL,
+    max_tokens: 2500,
+    system: systemPrompt,
+    messages: [{ role: "user", content: userPrompt }],
+  });
+
+  const textBlock = response.content.find((b) => b.type === "text");
+  if (!textBlock || textBlock.type !== "text") {
+    throw new Error("Resposta da Claude API sem bloco de texto.");
   }
 
-  const supabase = createAdminClient();
-  const log: string[] = [];
-
-  // 1) junta a lista padrão com o que os usuários colocaram na watchlist
-  const { data: watchlistRows } = await supabase.from("watchlist").select("symbol, asset_type");
-  const extra = watchlistRows ?? [];
-
-  const brSymbols = Array.from(
-    new Set([...DEFAULT_BR_STOCKS, ...extra.filter((w) => w.asset_type === "acao_br").map((w) => w.symbol)])
-  );
-  const usSymbols = Array.from(
-    new Set([...DEFAULT_US_STOCKS, ...extra.filter((w) => w.asset_type === "acao_us").map((w) => w.symbol)])
-  );
-  const cryptoSymbols = Array.from(
-    new Set([...DEFAULT_CRYPTO, ...extra.filter((w) => w.asset_type === "cripto").map((w) => w.symbol)])
-  );
-
-  // 2) busca os dados brutos em paralelo
-  const [brStocks, usStocks, cryptos] = await Promise.all([
-    fetchBrStockQuotes(brSymbols),
-    fetchUsStockQuotes(usSymbols),
-    fetchCrossReferencedCrypto(cryptoSymbols),
-  ]);
-  log.push(`Dados brutos: ${brStocks.length} ações BR, ${usStocks.length} ações US, ${cryptos.length} criptos.`);
-
-  // 3) gera a análise da Claude API para cada ativo e grava snapshot + histórico
-  async function saveAsset(symbol: string, assetType: AssetType, name: string, price: number, change24h: number | null, facts: Record<string, unknown>) {
-    try {
-      const analysis = await generateAssetAnalysis({ symbol, assetType, facts });
-
-      await supabase.from("asset_snapshots").upsert(
-        {
-          symbol,
-          asset_type: assetType,
-          name,
-          price,
-          change_24h: change24h,
-          fundamentals: facts,
-          score: analysis.score,
-          score_breakdown: analysis.breakdown,
-          classification: analysis.classification,
-          analysis: analysis.text,
-          source: { generated_by: "claude", model_facts: facts },
-          fetched_at: new Date().toISOString(),
-        },
-        { onConflict: "symbol,asset_type" }
-      );
-
-      await supabase.from("asset_history").insert({
-        symbol,
-        asset_type: assetType,
-        price,
-        score: analysis.score,
-      });
-    } catch (err) {
-      log.push(`Erro ao analisar ${symbol}: ${(err as Error).message}`);
-    }
-  }
-
-  await Promise.all([
-    ...brStocks.map((q) => saveAsset(q.symbol, "acao_br", q.name, q.price, q.change24h, stockFacts(q))),
-    ...usStocks.map((q) => saveAsset(q.symbol, "acao_us", q.name, q.price, q.change24h, stockFacts(q))),
-    ...cryptos.map((q) =>
-      saveAsset(q.symbol, "cripto", q.name, q.priceUsd, q.change24h, cryptoFacts(q))
-    ),
-  ]);
-
-  // 4) busca e classifica notícias
   try {
-    const news = await fetchAllNews();
-    const watchedSymbols = [...brSymbols, ...usSymbols, ...cryptoSymbols];
-    // processa em lotes de 15 para manter o prompt enxuto
-    const batches: (typeof news)[] = [];
-    for (let i = 0; i < news.length; i += 15) batches.push(news.slice(i, i + 15));
-
-    for (const batch of batches) {
-      const classified = await classifyNewsBatch(batch, watchedSymbols);
-      for (const item of classified) {
-        await supabase.from("news_alerts").upsert(
-          {
-            region: item.region,
-            headline: item.headline,
-            summary: item.summary,
-            related_symbols: item.relatedSymbols,
-            impact: item.impact,
-            changes_thesis: item.changesThesis,
-            source_url: item.link,
-            source_name: item.sourceName,
-            published_at: item.publishedAt,
-          },
-          { onConflict: "headline" }
-        );
-      }
-    }
-    log.push(`Notícias processadas: ${news.length}`);
-  } catch (err) {
-    log.push(`Erro ao processar notícias: ${(err as Error).message}`);
+    const parsed = extractJson(textBlock.text);
+    return {
+      score: parsed.score,
+      breakdown: parsed.breakdown ?? {},
+      classification: parsed.classification,
+      text: parsed.text,
+    };
+  } catch {
+    // Se ainda assim vier um JSON quebrado, não derruba o resto do radar —
+    // devolve um resultado neutro sinalizando o problema, em vez de lançar erro.
+    return {
+      score: 5,
+      breakdown: {},
+      classification: "⚠️ Análise indisponível",
+      text: "Não foi possível gerar a análise completa desta vez. Tente reanalisar em instantes.",
+    };
   }
-
-  return NextResponse.json({ ok: true, log, ranAt: new Date().toISOString() });
 }
 
-// Permite testar manualmente pelo navegador (ainda exige o header Authorization via ferramenta tipo curl/Postman)
-export async function GET(req: NextRequest) {
-  return POST(req);
+/**
+ * Resume e classifica um lote de notícias: o que aconteceu, por que importa,
+ * qual o impacto provável e se muda a tese de compra/venda de algum ativo acompanhado.
+ */
+export async function classifyNewsBatch(
+  items: NewsItem[],
+  watchedSymbols: string[]
+): Promise<ClassifiedNews[]> {
+  if (items.length === 0) return [];
+  const client = getClient();
+
+  const systemPrompt = `Você organiza um radar diário de investimentos (ações BR, ações US e cripto) para um investidor brasileiro.
+Para cada notícia da lista, devolva um resumo de 1-2 frases em português, o impacto provável (positivo, neutro ou negativo),
+se isso muda a tese de compra/venda de algum ativo, e quais símbolos de ativos acompanhados (se algum) são afetados.
+Os símbolos acompanhados são: ${watchedSymbols.join(", ") || "nenhum específico"}.
+Devolva SOMENTE um JSON válido: um array de objetos no formato
+{ "headline": "<mesmo headline recebido>", "summary": "...", "impact": "positivo|neutro|negativo", "changesThesis": true|false, "relatedSymbols": ["..."] }`;
+
+  const userPrompt = JSON.stringify(
+    items.map((i) => ({ headline: i.headline, source: i.sourceName, region: i.region })),
+    null,
+    2
+  );
+
+  const response = await client.messages.create({
+    model: MODEL,
+    max_tokens: 6000,
+    system: systemPrompt,
+    messages: [{ role: "user", content: userPrompt }],
+  });
+
+  const textBlock = response.content.find((b) => b.type === "text");
+  if (!textBlock || textBlock.type !== "text") return [];
+
+  let parsedList: Array<{
+    headline: string;
+    summary: string;
+    impact: "positivo" | "neutro" | "negativo";
+    changesThesis: boolean;
+    relatedSymbols: string[];
+  }>;
+
+  try {
+    parsedList = extractJson(textBlock.text);
+  } catch {
+    // Lote com JSON quebrado — não derruba as outras notícias, só pula este lote.
+    return [];
+  }
+
+  return items
+    .map((item) => {
+      const match = parsedList.find((p) => p.headline === item.headline);
+      if (!match) return null;
+      return { ...item, ...match };
+    })
+    .filter((x): x is ClassifiedNews => x !== null);
 }
