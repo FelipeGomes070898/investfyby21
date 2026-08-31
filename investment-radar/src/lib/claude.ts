@@ -47,7 +47,7 @@ Dados: ${JSON.stringify(params.facts, null, 2)}`;
 
   const response = await client.messages.create({
     model: MODEL,
-    max_tokens: 1500,
+    max_tokens: 2500,
     system: systemPrompt,
     messages: [{ role: "user", content: userPrompt }],
   });
@@ -57,13 +57,24 @@ Dados: ${JSON.stringify(params.facts, null, 2)}`;
     throw new Error("Resposta da Claude API sem bloco de texto.");
   }
 
-  const parsed = extractJson(textBlock.text);
-  return {
-    score: parsed.score,
-    breakdown: parsed.breakdown ?? {},
-    classification: parsed.classification,
-    text: parsed.text,
-  };
+  try {
+    const parsed = extractJson(textBlock.text);
+    return {
+      score: parsed.score,
+      breakdown: parsed.breakdown ?? {},
+      classification: parsed.classification,
+      text: parsed.text,
+    };
+  } catch {
+    // Se ainda assim vier um JSON quebrado, não derruba o resto do radar —
+    // devolve um resultado neutro sinalizando o problema, em vez de lançar erro.
+    return {
+      score: 5,
+      breakdown: {},
+      classification: "⚠️ Análise indisponível",
+      text: "Não foi possível gerar a análise completa desta vez. Tente reanalisar em instantes.",
+    };
+  }
 }
 
 /**
